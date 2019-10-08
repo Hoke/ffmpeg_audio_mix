@@ -46,6 +46,10 @@ bool AudioDecoder::init(AVStream *ast){
     if (ret<0) {
         return false;
     }
+    
+    if ((ret = avcodec_open2(codec_ctx_, codec_, NULL)) < 0) {
+           return false;
+       }
     return true;
 }
 

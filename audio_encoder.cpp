@@ -67,6 +67,10 @@ int AudioEncoder::encode(AVFrame *frame,AVPacket *packet,int *got_frame){
     return ret;
 }
 
+AVCodecContext *AudioEncoder::getCodecCtx(){
+    return codec_ctx_;
+}
+
 
 
 

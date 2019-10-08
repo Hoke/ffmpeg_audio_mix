@@ -21,6 +21,7 @@ public:
     bool init(AVCodecID codec_id);
    
     int encode(AVFrame *frame,AVPacket *packet,int *got_frame);
+    AVCodecContext *getCodecCtx();
 private:
     AVCodec *codec_;
     AVCodecContext *codec_ctx_;

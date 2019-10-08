@@ -7,7 +7,10 @@
 //
 
 #include "media_muxer.hpp"
+#include "audio_encoder.hpp"
 class MediaDemuxer;
+class AudioEncoder;
+
 MediaMuxer::MediaMuxer():audio_stream_(NULL),video_stream_(NULL),fmt_ctx_(NULL){
 }
 
@@ -80,6 +83,11 @@ void MediaMuxer::add_stream(AVFormatContext *fmt_ctx, AVCodecID codec_id){
             av_dict_copy(&video_stream_->metadata, vst->metadata, 0);
         }
 }
+
+int32_t MediaMuxer::add_audio_stream(AudioEncoder *audio_encoder){
+    return add_audio_stream(audio_encoder->getCodecCtx());
+    
+}
       
     
 int32_t MediaMuxer::add_audio_stream(AVCodecContext *ctx) {
@@ -87,6 +95,9 @@ int32_t MediaMuxer::add_audio_stream(AVCodecContext *ctx) {
        audio_stream_->id = fmt_ctx_->nb_streams - 1;
        audio_stream_->time_base = ctx->time_base;
        int ret = avcodec_parameters_from_context(audio_stream_->codecpar, ctx);
+    if (fmt_ctx_->oformat->flags&AVFMT_GLOBALHEADER) {
+           audio_stream_->codec->flags|=AV_CODEC_FLAG_GLOBAL_HEADER;
+       }
        if (ret < 0) {
            return -1;
        } else {
@@ -133,10 +144,16 @@ int32_t MediaMuxer::add_video_stream(AVCodecContext *ctx, bool rotated) {
     }
 }
 
+/// <#Description#>
+/// @param filename <#filename description#>
 bool MediaMuxer::write_header(const char *filename) {
     // avcodec_parameters_from_context(video_stream_->codecpar, ctx_);
     AVDictionary *opt = NULL;
     int ret;
+    
+   /* if (fmt_ctx_->oformat->flags&AVFMT_GLOBALHEADER) {
+        audio_stream_->codec->flags|=AV_CODEC_FLAG_GLOBAL_HEADER;
+    }*/
     if (!(fmt_ctx_->oformat->flags & AVFMT_NOFILE)) {
         ret = avio_open(&fmt_ctx_->pb, filename, AVIO_FLAG_WRITE);
         if (ret < 0) {
@@ -145,7 +162,7 @@ bool MediaMuxer::write_header(const char *filename) {
     }
 
     /* Write the stream header, if any. */
-    ret = avformat_write_header(fmt_ctx_, &opt);
+    ret = avformat_write_header(fmt_ctx_, NULL);
     if (ret < 0) {
         return false;
     }

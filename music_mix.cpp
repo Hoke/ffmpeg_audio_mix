@@ -44,13 +44,7 @@ enum CaptureState
 };
 
 
-AVFormatContext *_fmt_ctx_spk=NULL;
-AVFormatContext *_fmt_ctx_mic=NULL;
-AVFormatContext *_fmt_ctx_out=NULL;
 
-int _index_spk=-1;
-int _index_mic=-1;
-int _index_a_out=-1;
 
 AVFilterGraph *_filter_graph=NULL;
 AVFilterContext *_filter_ctx_src_spk=NULL;
@@ -61,6 +55,7 @@ CaptureState _state=CaptureState::PREPARED;
 
 AVAudioFifo *_fifo_spk=NULL;
 AVAudioFifo *_fifo_mic=NULL;
+AVAudioFifo *_fifo_out_=NULL;
 
 pthread_mutex_t _speaker_mutex;
 pthread_mutex_t _microphone_mutex;
@@ -68,12 +63,15 @@ pthread_cond_t _speaker_cond;
 pthread_cond_t _microphone_cond;
 
 pthread_t g_thread[2] ;
-AVCodecContext *_codec_ctx_speaker;
-AVCodecContext *_codec_ctx_mic;
+
 AudioEncoder *audio_encoder_;
-AudioDecoder *audio_decoder_;
+AudioDecoder *audio_decoder1_;
+AudioDecoder *audio_decoder2_;
 MediaMuxer *media_muxer_;
-MediaDemuxer *media_demuxer_;
+MediaDemuxer *media_demuxer1_;
+MediaDemuxer *media_demuxer2_;
+int64_t main_duration=0;
+int main_index=1;
 
 
 
@@ -89,147 +87,91 @@ void initRecorder(){
     pthread_cond_init(&_microphone_cond, NULL);
 }
 
-int open_spearker_input(char *input_format,char *url){
+void flush_audio_encoder(int64_t frame_count) {
+AVPacket pkt_flush;
+pkt_flush.data = NULL;
+pkt_flush.size = 0;
+int got_frame = 0;
+av_init_packet(&pkt_flush);
+
+int ret = audio_encoder_->encode(NULL, &pkt_flush, &got_frame);
     
-    AVInputFormat *ifmat=av_find_input_format(input_format);
-    AVDictionary *opt1=NULL;
-    av_dict_set(&opt1, "rtbufdize","10M" , 0);
-    AVCodec *codec;
-    
-    
-    int ret=0;
-    ret=avformat_open_input(&_fmt_ctx_spk, url, ifmat, &opt1);
-    if (ret<0) {
-        printf("Speaker: failed to call avformat_open_input\n");
-        return -1;
+    if (ret >= 0 && got_frame) {
+        pkt_flush.stream_index=0;
+        pkt_flush.pts=frame_count*media_muxer_->get_audio_stream()->codecpar->frame_size;
+        pkt_flush.dts=pkt_flush.pts;
+        pkt_flush.duration=media_muxer_->get_audio_stream()->codec->frame_size;
+        
+        pkt_flush.pts = av_rescale_q_rnd(pkt_flush.pts,
+                                         media_muxer_->get_audio_stream()->time_base,
+                                         media_muxer_->get_audio_stream()->time_base,
+                                         (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+        pkt_flush.dts = pkt_flush.pts;
+        pkt_flush.duration = av_rescale_q_rnd(pkt_flush.duration,
+                                                                 media_muxer_->get_audio_stream()->codec->time_base,
+                                                                 media_muxer_->get_audio_stream()->time_base,
+                                                                 (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+        
+        media_muxer_->write_frame(&pkt_flush);
     }
-    
-    ret=avformat_find_stream_info(_fmt_ctx_spk, NULL);
-    if (ret<0) {
-        printf("Speaker: failed to call avformat_find_stream_info\n");
-        return -1;
-    }
-    _index_spk=av_find_best_stream(_fmt_ctx_spk, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
-    if (_index_spk<0) {
-        printf("Speaker:negative audio index\n");
-        return -1;
-    }
-    _codec_ctx_speaker=avcodec_alloc_context3(codec);
-    if (_codec_ctx_speaker==NULL) {
-         printf("Speaker:avcodec_alloc_context3\n");
-               return -1;
-    }
-    avcodec_parameters_to_context(_codec_ctx_speaker, _fmt_ctx_spk->streams[_index_spk]->codecpar);
-    ret=avcodec_open2(_codec_ctx_speaker, codec, NULL);
-    if (ret<0) {
-        printf("Speaker:failed to call avcodec_open2\n");
-        return -1;
-    }
-    av_dump_format(_fmt_ctx_spk, _index_spk, url, 0);
-    return 0;
 }
 
 
+    
+int open_spearker_input(char *input_format,char *url){
+    media_demuxer1_=new MediaDemuxer();
+    if(!(media_demuxer1_->init(url))){
+        printf("speaker:failed to init url");
+        return -1;
+    }
+    audio_decoder1_=new AudioDecoder();
+    if(!(audio_decoder1_->init(media_demuxer1_->get_audio_stream()))){
+        printf("speaker:failed to init decoder");
+        return -1;
+    }
+    
+    return 0;
+}
+    
 
 int open_microphone_input(char *input_format,char *url){
-    
-    AVCodec *codec;
-    AVInputFormat *ifmt=av_find_input_format(input_format);
-    AVDictionary *opt1=NULL;
-    av_dict_set(&opt1, "rebufsize", "10M", 0);
-    
-    int ret=0;
-    ret=avformat_open_input(&_fmt_ctx_mic, url, ifmt, &opt1);
-    if (ret<0) {
-        printf("Microphone:failed to call avformat_open_input\n");
-        return -1;
-    }
-    ret=avformat_find_stream_info(_fmt_ctx_mic, NULL);
-    if (ret<0) {
-        printf("Microphone:failed to call avformat_find_stream_info\n");
-        return -1;
-        
-    }
-    _index_mic=av_find_best_stream(_fmt_ctx_mic, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
-    
-    if (_index_mic<0) {
-        printf("MicroPhone:negative audio index\n");
-        return -1;
-    }
-    _codec_ctx_mic=avcodec_alloc_context3(codec);
-    
-    if (_codec_ctx_mic==NULL) {
-         printf("mic:avcodec_alloc_context3\n");
+    media_demuxer2_=new MediaDemuxer();
+    if (!(media_demuxer2_->init(url))) {
+         printf("mic:failed to init url");
                return -1;
     }
-    
-    avcodec_parameters_to_context(_codec_ctx_mic, _fmt_ctx_mic->streams[_index_mic]->codecpar);
-
-    ret=avcodec_open2(_codec_ctx_mic, codec, NULL);
-    if (ret<0) {
-        printf("Microphone:failed to call avcodec_open2\n");
+    audio_decoder2_=new AudioDecoder();
+    if(!(audio_decoder2_->init(media_demuxer2_->get_audio_stream()))){
+        printf("mic:failed to init decoder");
         return -1;
-        
     }
-    av_dump_format(_fmt_ctx_mic, _index_mic, url, 0);
     return 0;
+   
 }
 
 int open_file_output(char *file_name){
-    int ret=0;
-    ret=avformat_alloc_output_context2(&_fmt_ctx_out, NULL, NULL, file_name);
-    if (ret<0) {
-        printf("Mixer:failed to call avformat_alloc_output_context2\n");
-        return -1;
-        
-    }
-    AVStream *stream_a=NULL;
-    stream_a=avformat_new_stream(_fmt_ctx_out, NULL);
-    if (stream_a==NULL) {
-        printf("Mixer:failed to call avformat_new_stream\n<#const char *, ...#>");
-        return -1;
-    }
-    _index_a_out=0;
+    media_muxer_=new MediaMuxer();
+    media_muxer_->init(file_name);
+   
     
-    stream_a->codec->codec_type=AVMEDIA_TYPE_AUDIO;
-    AVCodec *codec_mp3=avcodec_find_encoder(AV_CODEC_ID_AAC);
-    stream_a->codec->codec=codec_mp3;
-    stream_a->codec->sample_rate=44100;
-    stream_a->codec->channels=2;
-    stream_a->codec->channel_layout=av_get_default_channel_layout(2);
-    stream_a->codec->sample_fmt=codec_mp3->sample_fmts[0];
-    stream_a->codec->bit_rate=128000;
-    stream_a->codec->time_base.num=1;
-    stream_a->codec->time_base.den=stream_a->codec->sample_rate;
-    stream_a->codec->codec_tag=0;
+    audio_encoder_=new AudioEncoder();
+    audio_encoder_->init(AV_CODEC_ID_AAC);
+    
+    media_muxer_->add_audio_stream(audio_encoder_);
+    media_muxer_->write_header(file_name);
     
     
-    if (_fmt_ctx_out->oformat->flags&AVFMT_GLOBALHEADER) {
-        stream_a->codec->flags|=AV_CODEC_FLAG_GLOBAL_HEADER;
-    }
-    if (avcodec_open2(stream_a->codec,stream_a->codec->codec, NULL)<0) {
-        printf("Mixer:failed to call avcodec_open2\n");
-        return -1;
-    }
-    if (!(_fmt_ctx_out->oformat->flags&AVFMT_NOFILE)) {
-        if (avio_open(&_fmt_ctx_out->pb, file_name, AVIO_FLAG_WRITE)<0) {
-            printf("Mixer:failed to call avio_open\n");
-            return -1;
-        }
-    }
     
-    if (avformat_write_header(_fmt_ctx_out, NULL)<0) {
-        printf("Mixter:fialed to call avformat_write_header\n");
-        return -1;
-    }
-    bool b=(!_fmt_ctx_out->streams[0]->time_base.num&&_fmt_ctx_out->streams[0]->codec->time_base.num);
-    av_dump_format(_fmt_ctx_out, _index_a_out, file_name, 1);
-    _fifo_spk=av_audio_fifo_alloc(_fmt_ctx_spk->streams[_index_spk]->codec->sample_fmt
-                                  , _fmt_ctx_spk->streams[_index_spk]->codec->channels
-                                  ,30*_fmt_ctx_spk->streams[_index_spk]->codec->frame_size);
-    _fifo_mic=av_audio_fifo_alloc(_fmt_ctx_mic->streams[_index_mic]->codec->sample_fmt
-                                  , _fmt_ctx_mic->streams[_index_mic]->codec->channels
-                                  , 30*_fmt_ctx_mic->streams[_index_mic]->codec->frame_size);
+    _fifo_spk=av_audio_fifo_alloc(media_demuxer1_->get_audio_stream()->codec->sample_fmt
+                                  , media_demuxer1_->get_audio_stream()->codec->channels
+                                  ,30*media_demuxer1_->get_audio_stream()->codec->frame_size);
+    _fifo_mic=av_audio_fifo_alloc(media_demuxer2_->get_audio_stream()->codec->sample_fmt
+                                  , media_demuxer2_->get_audio_stream()->codec->channels
+                                  , 30*media_demuxer2_->get_audio_stream()->codec->frame_size);
+    
+    _fifo_out_=av_audio_fifo_alloc(media_demuxer2_->get_audio_stream()->codec->sample_fmt
+                                    , media_demuxer2_->get_audio_stream()->codec->channels
+                                   , 30*media_demuxer2_->get_audio_stream()->codec->frame_size);
     
     return 0;
     
@@ -252,19 +194,19 @@ int init_filter(char* filter_desc){
     
     snprintf(args_spk,sizeof(args_spk)
              ,"time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=0x%u"
-             ,_fmt_ctx_spk->streams[_index_spk]->codec->time_base.num
-             ,_fmt_ctx_spk->streams[_index_spk]->codec->time_base.den
-             ,_fmt_ctx_spk->streams[_index_spk]->codec->sample_rate
-             ,av_get_sample_fmt_name(_fmt_ctx_spk->streams[_index_spk]->codec->sample_fmt)
-             ,_fmt_ctx_spk->streams[_index_spk]->codec->channel_layout);
+             ,media_demuxer1_->get_audio_stream()->codec->time_base.num
+             ,media_demuxer1_->get_audio_stream()->codec->time_base.den
+             ,media_demuxer1_->get_audio_stream()->codec->sample_rate
+             ,av_get_sample_fmt_name(media_demuxer1_->get_audio_stream()->codec->sample_fmt)
+             ,media_demuxer1_->get_audio_stream()->codec->channel_layout);
     
     snprintf(args_mic, sizeof(args_mic)
              ,"time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=0x%u"
-             ,_fmt_ctx_mic->streams[_index_mic]->codec->time_base.num,
-             _fmt_ctx_mic->streams[_index_mic]->codec->time_base.den,
-             _fmt_ctx_mic->streams[_index_mic]->codec->sample_rate,
-             av_get_sample_fmt_name(_fmt_ctx_mic->streams[_index_mic]->codec->sample_fmt),
-             _fmt_ctx_mic->streams[_index_mic]->codec->channel_layout);
+             ,media_demuxer2_->get_audio_stream()->codec->time_base.num,
+             media_demuxer2_->get_audio_stream()->codec->time_base.den,
+             media_demuxer2_->get_audio_stream()->codec->sample_rate,
+             av_get_sample_fmt_name(media_demuxer2_->get_audio_stream()->codec->sample_fmt),
+             media_demuxer2_->get_audio_stream()->codec->channel_layout);
     
     int ret=0;
     ret=avfilter_graph_create_filter(&_filter_ctx_src_spk, filter_src_spk, pad_name_spk
@@ -286,8 +228,8 @@ int init_filter(char* filter_desc){
         printf("Filter:failed to call avfilter_graph_create_filer --sinl\n");
         return -1;
     }
-    
-    AVCodecContext *encodec_ctx=_fmt_ctx_out->streams[_index_a_out]->codec;
+   
+    AVCodecContext *encodec_ctx=audio_encoder_->getCodecCtx();
     ret=av_opt_set_bin(_filter_ctx_sink, "sample_fmts"
                        , (uint8_t*)&encodec_ctx->sample_fmt
                        , sizeof(encodec_ctx->sample_fmt), AV_OPT_SEARCH_CHILDREN);
@@ -355,21 +297,31 @@ void *speaker_cap_thread_proc(void *args){
     AVFrame *pFrame=av_frame_alloc();
     AVPacket packet;
     av_init_packet(&packet);
+    bool isMain=main_index==0;
     
     int got_sound;
     
     while (_state==CaptureState::RUNNING) {
         packet.data=NULL;
         packet.size=0;
-        if (av_read_frame(_fmt_ctx_spk, &packet)<0) {
+        int ret=media_demuxer1_->read_fream(&packet);
+        if (ret<0) {
+            printf("thread:speaker ret:%d\n",ret);
+            if(ret==AVERROR_EOF){
+                if (!isMain) {
+                    media_demuxer1_->seek_to(0, 0);
+                }else{
+                    _state=CaptureState::STOPPED;
+                }
+            }
+            usleep(10000);
             continue;
         }
-        if (packet.stream_index==_index_spk) {
-            if (avcodec_decode_audio4(_codec_ctx_speaker, pFrame, &got_sound, &packet)<0) {
+        if (media_demuxer1_->is_audio_stream(packet.stream_index)) {
+            if (audio_decoder1_->decode(&packet, pFrame, &got_sound)<0) {
                 break;
             }
             av_packet_unref(&packet);
-            
             if (!got_sound) {
                 continue;
             }
@@ -389,6 +341,7 @@ void *speaker_cap_thread_proc(void *args){
                 
             }
         }
+       
     }
     av_frame_free(&pFrame);
     return 0;
@@ -399,25 +352,32 @@ void *microphone_cap_thread_proc(void *args){
     AVFrame *pFrame=av_frame_alloc();
     AVPacket packet;
     av_init_packet(&packet);
+     bool isMain=main_index==1;
     
     int got_sound;
     while (_state==CaptureState::PREPARED) {
-        
+         usleep(10000);
     }
     while (_state==CaptureState::RUNNING) {
         packet.data=NULL;
         packet.size=0;
-        if (av_read_frame(_fmt_ctx_mic, &packet)) {
+        int ret=media_demuxer2_->read_fream(&packet);
+        if (ret<0) {
+             printf("thread:mic ret:%d\n",ret);
+            usleep(10000);
+            if (!isMain) {
+                media_demuxer2_->seek_to(0, 0);
+            }else{
+                _state=CaptureState::STOPPED;
+            }
             continue;
         }
-        if (packet.stream_index==_index_mic) {
-            if (avcodec_decode_audio4(_codec_ctx_mic, pFrame, &got_sound, &packet)<0) {
+        if (media_demuxer2_->is_audio_stream(packet.stream_index)) {
+            if (audio_decoder2_->decode(&packet, pFrame, &got_sound)<0) {
+                usleep(10000);
                 continue;
             }
             av_packet_unref(&packet);
-            if (!got_sound) {
-                continue;
-            }
             int fifo_mic_space=av_audio_fifo_space(_fifo_mic);
             while (fifo_mic_space<pFrame->nb_samples&&_state==CaptureState::RUNNING) {
                 usleep(10000);
@@ -429,8 +389,7 @@ void *microphone_cap_thread_proc(void *args){
                 av_audio_fifo_write(_fifo_mic, (void**)pFrame->data, pFrame->nb_samples);
                 pthread_mutex_unlock(&_microphone_mutex);
             }
-            
-            
+                       
         }
     }
     av_frame_free(&pFrame);
@@ -455,14 +414,41 @@ void relase(){
     avfilter_graph_free(&_filter_graph);
     
     
-    if (_fmt_ctx_out)
-    {
-        avio_close(_fmt_ctx_out->pb);
-    }
-    
-    avformat_close_input(&_fmt_ctx_spk);
-    avformat_close_input(&_fmt_ctx_mic);
-    avformat_free_context(_fmt_ctx_out);
+    if (media_demuxer1_) {
+           media_demuxer1_->uninit();
+           delete media_demuxer1_;
+           media_demuxer1_ = NULL;
+       }
+    if (media_demuxer2_) {
+              media_demuxer2_->uninit();
+              delete media_demuxer2_;
+              media_demuxer2_ = NULL;
+          }
+
+       
+       if (audio_decoder1_) {
+           delete audio_decoder1_;
+           audio_decoder1_ = NULL;
+       }
+    if (audio_decoder2_) {
+              delete audio_decoder2_;
+              audio_decoder2_ = NULL;
+          }
+
+      
+      
+
+       if (audio_encoder_) {
+           delete audio_encoder_;
+           audio_encoder_ = NULL;
+       }
+
+       if (media_muxer_) {
+           delete media_muxer_;
+           media_muxer_ = NULL;
+       }
+
+     
     
 }
 
@@ -475,6 +461,9 @@ int main(){
     time_t rawtime;
     int speaker_count=0;
     int micro_count=0;
+    
+    int64_t duration[2]={0,0};
+    int64_t cur_time=0;
     
     tm *timeinfo;
     time(&rawtime);
@@ -514,12 +503,20 @@ int main(){
     
     pthread_create(&g_thread[0], NULL, speaker_cap_thread_proc, NULL);
     pthread_create(&g_thread[1], NULL, microphone_cap_thread_proc, NULL);
+    if (main_index==0) {
+        main_duration=media_demuxer1_->get_duration();
+    }else{
+        main_duration=media_demuxer2_->get_duration();
+    }
+    
+    
+    
     
     
     
     int tmp_fifo_failed=0;
     int64_t frame_count=0;
-    while (_state!=CaptureState::FINISHED) {
+    while (_state==CaptureState::RUNNING) {
         
         int ret =0;
         AVFrame *pFrame_spk=av_frame_alloc();
@@ -528,16 +525,17 @@ int main(){
         int got_packet_ptr;
         int fifo_spk_size=av_audio_fifo_size(_fifo_spk);
         int fifo_mic_size=av_audio_fifo_size(_fifo_mic);
-        int frame_spk_min_size=_fmt_ctx_spk->streams[_index_spk]->codec->frame_size;
-        int frame_mic_min_size=_fmt_ctx_mic->streams[_index_mic]->codec->frame_size;
+        int frame_spk_min_size=media_demuxer1_->get_audio_stream()->codecpar->frame_size;
+        int frame_mic_min_size=media_demuxer2_->get_audio_stream()->codecpar->frame_size;
         
         if(fifo_spk_size>=frame_spk_min_size||fifo_mic_size>=frame_mic_min_size){
             tmp_fifo_failed=0;
-            if (fifo_spk_size>=frame_spk_min_size) {
+            if (fifo_spk_size>=frame_spk_min_size&&(duration[0]-cur_time)<1*1000*1000) {
                 pFrame_spk->nb_samples=frame_spk_min_size;
-                pFrame_spk->channel_layout=_fmt_ctx_spk->streams[_index_spk]->codec->channel_layout;
-                pFrame_spk->format=_fmt_ctx_spk->streams[_index_spk]->codec->sample_fmt;
-                pFrame_spk->sample_rate=_fmt_ctx_spk->streams[_index_spk]->codec->sample_rate;
+                pFrame_spk->channel_layout=media_demuxer1_->get_audio_stream()->codec->channel_layout;
+               
+                pFrame_spk->format=media_demuxer1_->get_audio_stream()->codec->sample_fmt;
+                pFrame_spk->sample_rate=media_demuxer1_->get_audio_stream()->codec->sample_rate;
                 av_frame_get_buffer(pFrame_spk, 0);
                 
                 pthread_mutex_lock(&_speaker_mutex);
@@ -545,6 +543,10 @@ int main(){
                 pthread_mutex_unlock(&_speaker_mutex);
                 
                 pFrame_spk->pts=speaker_count*frame_spk_min_size;
+                
+                
+                
+                duration[0]= pFrame_spk->pts*av_q2d(media_demuxer1_->get_audio_stream()->codec->time_base)*1000*1000;
                 
                 speaker_count++;
                 ret=av_buffersrc_add_frame(_filter_ctx_src_spk, pFrame_spk);
@@ -555,11 +557,11 @@ int main(){
                 }
             }
             
-            if (fifo_mic_size>=frame_mic_min_size) {
+            if (fifo_mic_size>=frame_mic_min_size&&(duration[1]-cur_time)<1*1000*1000) {
                 pFrame_mic->nb_samples=frame_mic_min_size;
-                pFrame_mic->channel_layout=_fmt_ctx_mic->streams[_index_mic]->codec->channel_layout;
-                pFrame_mic->format=_fmt_ctx_mic->streams[_index_mic]->codec->sample_fmt;
-                pFrame_mic->sample_rate=_fmt_ctx_mic->streams[_index_mic]->codec->sample_rate;
+                pFrame_mic->channel_layout=media_demuxer2_->get_audio_stream()->codec->channel_layout;
+                pFrame_mic->format=media_demuxer2_->get_audio_stream()->codec->sample_fmt;
+                pFrame_mic->sample_rate=media_demuxer2_->get_audio_stream()->codec->sample_rate;
                 av_frame_get_buffer(pFrame_mic, 0);
                 
                 pthread_mutex_lock(&_microphone_mutex);
@@ -568,6 +570,7 @@ int main(){
                 
                 
                 pFrame_mic->pts=micro_count*frame_mic_min_size;
+                duration[1]= pFrame_mic->pts*av_q2d(media_demuxer2_->get_audio_stream()->codec->time_base)*1000*1000;
                 
                 
                 micro_count++;
@@ -586,6 +589,7 @@ int main(){
                 AVFrame *pFrame_out=av_frame_alloc();
                 ret=av_buffersink_get_frame_flags(_filter_ctx_sink, pFrame_out, 0);
                 if (ret<0) {
+                    //usleep(10000);
                     printf("Mixer:failed to call av_buffersink_get_frame_flags\n");
                     break;
                 }
@@ -594,29 +598,36 @@ int main(){
                     av_init_packet(&packet_out);
                     packet_out.data=NULL;
                     packet_out.size=0;
-                    ret=avcodec_encode_audio2(_fmt_ctx_out->streams[_index_a_out]->codec
-                                              , &packet_out, pFrame_out, &got_packet_ptr);
+                    
+                    ret=audio_encoder_->encode(pFrame_out, &packet_out, &got_packet_ptr);
+                    
+                  
                     if (ret<0) {
                         printf("Mixer:failed to call avcodec_encode_audio2\n");
                         break;
                     }
                     if (got_packet_ptr) {
-                        packet_out.stream_index=_index_a_out;
-                        packet_out.pts=frame_count*_fmt_ctx_out->streams[_index_a_out]->codec->frame_size;
+                        packet_out.stream_index=0;
+                        packet_out.pts=frame_count*media_muxer_->get_audio_stream()->codecpar->frame_size;
                         packet_out.dts=packet_out.pts;
-                        packet_out.duration=_fmt_ctx_out->streams[_index_a_out]->codec->frame_size;
+                        packet_out.duration=media_muxer_->get_audio_stream()->codec->frame_size;
                         
                         packet_out.pts = av_rescale_q_rnd(packet_out.pts,
-                                                          _fmt_ctx_out->streams[_index_a_out]->codec->time_base,
-                                                          _fmt_ctx_out->streams[_index_a_out]->time_base,
+                                                          media_muxer_->get_audio_stream()->time_base,
+                                                          media_muxer_->get_audio_stream()->time_base,
                                                           (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
                         packet_out.dts = packet_out.pts;
                         packet_out.duration = av_rescale_q_rnd(packet_out.duration,
-                                                               _fmt_ctx_out->streams[_index_a_out]->codec->time_base,
-                                                               _fmt_ctx_out->streams[_index_a_out]->time_base,
+                                                               media_muxer_->get_audio_stream()->codec->time_base,
+                                                               media_muxer_->get_audio_stream()->time_base,
                                                                (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+                        cur_time=packet_out.pts*av_q2d(media_muxer_->get_audio_stream()->time_base)*1000*1000;
                         frame_count++;
-                        ret=av_interleaved_write_frame(_fmt_ctx_out, &packet_out);
+                        ret=media_muxer_->write_frame(&packet_out);
+                        if (cur_time>=main_duration) {
+                            _state=CaptureState::STOPPED;
+                        }
+                        
                         if (ret<0) {
                             printf("Mixer:failed to call av_interleaved_write_frame\n");
                             
@@ -646,7 +657,10 @@ int main(){
         }
         
     }
-    av_write_trailer(_fmt_ctx_out);
+    
+    flush_audio_encoder(frame_count);
+    media_muxer_->write_tailer();
+    relase();
    
     
     return ret;

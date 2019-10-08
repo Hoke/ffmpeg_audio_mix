@@ -15,6 +15,7 @@ extern "C"{
 #include "MediaDemuxer.hpp"
 
 class MediaDemuxer;
+class AudioEncoder;
 class MediaMuxer{
 public:
     MediaMuxer();
@@ -25,6 +26,7 @@ public:
     int write_frame(AVPacket *pkt);
     int32_t add_audio_stream(AVCodecContext *ctx);
     int32_t add_video_stream(AVCodecContext *ctx,bool rotated);
+    int32_t add_audio_stream(AudioEncoder *audio_encoder);
     void set_video_stream_proterty(const char *key,const char *value);
     bool write_header(const char *file_name);
     AVStream *get_stream(int index);
